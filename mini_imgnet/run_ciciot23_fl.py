@@ -586,9 +586,6 @@ def main():
                 
                 optimizer = torch.optim.Adam(local_model.parameters(), lr=args.lr, weight_decay=1e-4)
                 
-                # Optional AMP support
-                scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
-                
                 losses = 0.0
                 for local_ep in range(args.local_epochs):
                     for batch in train_loader:
@@ -596,13 +593,11 @@ def main():
                         targets = batch['label'].to(device)
                         
                         optimizer.zero_grad()
-                        with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-                            logits = local_model(inputs)
-                            loss = F.cross_entropy(logits, targets)
+                        logits = local_model(inputs)
+                        loss = F.cross_entropy(logits, targets)
                             
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
+                        loss.backward()
+                        optimizer.step()
                         
                         losses += loss.item()
                         
@@ -749,8 +744,7 @@ def main():
                             eval_batch_size = 8192
                             for i in range(0, total_c, eval_batch_size):
                                 batch_x = x_c[i:i + eval_batch_size].to(device)
-                                with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-                                    features = local_model.encoder(batch_x)
+                                features = local_model.encoder(batch_x)
                                 sum_features += features.sum(dim=0)
                             
                             sum_features_global[class_val] += sum_features
@@ -813,8 +807,6 @@ def main():
                         lr=args.lr, 
                         weight_decay=1e-4
                     )
-                    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
-                    
                     losses = 0.0
                     for local_ep in range(args.local_epochs):
                         for batch in train_loader:
@@ -822,18 +814,17 @@ def main():
                             targets = batch['label'].to(device)
                             
                             optimizer.zero_grad()
-                            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-                                logits = local_model(inputs)
-                                local_logits = logits[:, classes]
-                                local_targets = torch.tensor([classes.index(t.item()) for t in targets], dtype=torch.long, device=device)
+                            logits = local_model(inputs)
+                            local_logits = logits[:, classes]
+                            local_targets = torch.tensor([classes.index(t.item()) for t in targets], dtype=torch.long, device=device)
+                            
+                            cls_loss = F.cross_entropy(local_logits, local_targets)
                                 
-                                cls_loss = F.cross_entropy(local_logits, local_targets)
-                                l2_loss = local_model.L2_weight_loss(l2_lambda=args.l2_lambda)
-                                total_loss = cls_loss + l2_loss
+                            l2_loss = local_model.L2_weight_loss(l2_lambda=args.l2_lambda)
+                            total_loss = cls_loss + l2_loss
                                 
-                            scaler.scale(total_loss).backward()
-                            scaler.step(optimizer)
-                            scaler.update()
+                            total_loss.backward()
+                            optimizer.step()
                             
                             losses += total_loss.item()
                             
@@ -946,8 +937,6 @@ def main():
                     local_model.train()
                     
                     optimizer_crt = torch.optim.Adam([local_model.fc.weight], lr=args.lr * 0.5)
-                    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
-                    
                     losses = 0.0
                     for local_ep in range(args.local_epochs):
                         for batch in cal_loader:
@@ -955,14 +944,12 @@ def main():
                             targets = batch['label'].to(device)
                             
                             optimizer_crt.zero_grad()
-                            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-                                logits = local_model(inputs)
-                                seen_logits = logits[:, :len(seen_classes)]
-                                loss = F.cross_entropy(seen_logits, targets)
+                            logits = local_model(inputs)
+                            seen_logits = logits[:, :len(seen_classes)]
+                            loss = F.cross_entropy(seen_logits, targets)
                                 
-                            scaler.scale(loss).backward()
-                            scaler.step(optimizer_crt)
-                            scaler.update()
+                            loss.backward()
+                            optimizer_crt.step()
                             
                             losses += loss.item()
                             
