@@ -237,10 +237,6 @@ def aggregate_adaptive_robust(client_weights, client_sample_counts, global_weigh
     Q_list = []
     update_norm_list = []
     
-    # 1. Calculate raw logs
-    raw_logs = [math.log(1 + count) for count in client_sample_counts]
-    max_log = max(raw_logs) if max(raw_logs) > 0 else 1.0
-    
     # Calculate Update Norm (Drift) exactly like AFSIC-IDS
     for i in range(num_clients):
         update_val = 0.0
@@ -254,11 +250,9 @@ def aggregate_adaptive_robust(client_weights, client_sample_counts, global_weigh
         update_norm_i = np.sqrt(update_val / max(1, num_params))
         update_norm_list.append(update_norm_i)
         
-        # Normalize log_sample to [0, 1] so Softmax(exp) doesn't just undo the log!
-        norm_log = raw_logs[i] / max_log
-        
-        # Q_i = normalized Data Volume - penalty for Drift
-        Q_i = norm_log - beta_norm * update_norm_i
+        # Q_i only relies on log samples and negative update_norm (since we don't have proto_cons in LCwoF)
+        log_sample = math.log(1 + client_sample_counts[i])
+        Q_i = log_sample - beta_norm * update_norm_i
         Q_list.append(Q_i)
 
     # ---------------------------------------------------------
