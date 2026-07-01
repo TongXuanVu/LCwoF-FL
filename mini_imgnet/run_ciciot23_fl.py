@@ -225,17 +225,52 @@ def load_checkpoint(model, checkpoint_path, device):
     return checkpoint
 
 
-def aggregate_fedavg(client_weights, client_sample_counts):
-    total_samples = sum(client_sample_counts)
-    if total_samples == 0:
-        return client_weights[0]
+def aggregate_adaptive_robust(client_weights, client_sample_counts, global_weights, tau=1.0, beta_norm=0.5):
+    """
+    Adaptive Robust Aggregation inspired by AFSIC-IDS.
+    Calculates a quality score Q_i based on Log-Quantity and Update Norm (Drift from global).
+    Weights are softmaxed.
+    """
+    import math
+    num_clients = len(client_weights)
+    scores = []
     
+    # 1. Calculate Update Norm (Drift) for each client
+    norms = []
+    for i in range(num_clients):
+        drift_sq = 0.0
+        for key in global_weights.keys():
+            if global_weights[key].dtype in [torch.float32, torch.float64, torch.float16]:
+                diff = client_weights[i][key].to('cpu').float() - global_weights[key].to('cpu').float()
+                drift_sq += torch.sum(diff ** 2).item()
+        norms.append(math.sqrt(drift_sq))
+    
+    max_norm = max(norms) if max(norms) > 0 else 1.0
+    normalized_norms = [n / max_norm for n in norms]
+    
+    # 2. Calculate Q_i score using log(1 + samples) to soften quantity skew
+    log_samples = [math.log(1 + count) for count in client_sample_counts]
+    max_log = max(log_samples) if max(log_samples) > 0 else 1.0
+    normalized_logs = [l / max_log for l in log_samples]
+    
+    for i in range(num_clients):
+        Q_i = normalized_logs[i] - beta_norm * normalized_norms[i]
+        scores.append(Q_i)
+        
+    # 3. Softmax weighting
+    exp_scores = [math.exp(q / tau) for q in scores]
+    sum_exp = sum(exp_scores)
+    alphas = [e / sum_exp for e in exp_scores]
+    
+    print(f"      [Adaptive Aggregation] Alphas: {[round(a, 4) for a in alphas]}")
+    
+    # 4. Aggregate
     w_avg = copy.deepcopy(client_weights[0])
     for key in w_avg.keys():
         w_avg[key] = torch.zeros_like(w_avg[key])
         
-    for i in range(len(client_weights)):
-        weight = client_sample_counts[i] / total_samples
+    for i in range(num_clients):
+        weight = alphas[i]
         for key in w_avg.keys():
             if torch.is_floating_point(client_weights[i][key]):
                 w_avg[key] += client_weights[i][key] * weight
@@ -621,7 +656,7 @@ def main():
                 
             # Server FedAvg aggregation
             avg_loss = np.mean(client_losses)
-            aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
+            aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
             global_model.load_state_dict(aggregated_weights)
             
             print(f"Task 1 Round {epoch+1}/{args.epochs_base} => Avg Client Loss: {avg_loss:.4f}")
@@ -858,7 +893,7 @@ def main():
                 
                 # Server aggregation
                 avg_loss = np.mean(client_losses)
-                aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
+                aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
                 global_model.load_state_dict(aggregated_weights)
                 
                 print(f"Task {task_idx} [Phase 2] Round {epoch+1}/{args.epochs_novel} => Avg Client Loss: {avg_loss:.4f}")
@@ -989,7 +1024,7 @@ def main():
                 if len(client_weights) > 0:
                     # Server aggregation
                     avg_loss = np.mean(client_losses)
-                    aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
+                    aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
                     global_model.load_state_dict(aggregated_weights)
                 else:
                     avg_loss = 0.0
