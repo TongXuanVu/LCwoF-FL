@@ -114,9 +114,8 @@ def evaluate(model, dataloader, device):
             inputs = batch['data'].to(device)
             targets = batch['label'].to(device)
             
-            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-                logits = model(inputs)
-                loss = F.cross_entropy(logits, targets)
+            logits = model(inputs)
+            loss = F.cross_entropy(logits, targets)
                 
             total_loss += loss.item() * inputs.size(0)
             total_samples += inputs.size(0)
@@ -280,8 +279,8 @@ def client_get_calibration_dataset(seen_classes, current_task_x, current_task_y,
     for c in seen_classes:
         if c not in current_task_classes:
             if c in exemplar_memory:
-                cal_x_list.append(exemplar_memory[c]['x'])
-                cal_y_list.append(exemplar_memory[c]['y'])
+                cal_x_list.append(exemplar_memory[c]['x'].cpu())
+                cal_y_list.append(exemplar_memory[c]['y'].cpu())
 
     # 2. Current classes from local training data
     for c in current_task_classes:
@@ -293,8 +292,8 @@ def client_get_calibration_dataset(seen_classes, current_task_x, current_task_y,
         if n_samples > 0:
             n_select = max(1, int(n_samples * 0.01))
             indices = np.random.choice(n_samples, n_select, replace=False)
-            cal_x_list.append(x_c[indices])
-            cal_y_list.append(y_c[indices])
+            cal_x_list.append(x_c[indices].cpu())
+            cal_y_list.append(y_c[indices].cpu())
 
     if len(cal_x_list) == 0:
         return None
