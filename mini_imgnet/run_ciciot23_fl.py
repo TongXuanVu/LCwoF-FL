@@ -557,6 +557,8 @@ def main():
         client_datasets = []
         for c in range(num_clients):
             c_path = os.path.join(args.data_root, "federated_data", f"client_{c}_task_1.pt")
+            if not os.path.exists(c_path):
+                c_path = os.path.join(args.data_root, "data", "federated_data", f"client_{c}_task_1.pt")
             c_data = torch.load(c_path, map_location="cpu", weights_only=False)
             c_x, c_y = c_data["x"].float(), c_data["y"].long()
             if args.debug:
