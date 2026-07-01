@@ -329,6 +329,12 @@ def main():
                         help="Path to directory containing multiple checkpoints to evaluate in test mode")
     parser.add_argument("--run_dir", type=str, default="",
                         help="Custom directory to save logs, CSV, and checkpoints")
+    parser.add_argument("--use_fewshot", action="store_true",
+                        help="Use the few-shot data split for incremental tasks")
+    parser.add_argument("--use_10shot", action="store_true",
+                        help="Use the 10-shot data split for incremental tasks")
+    parser.add_argument("--novel_data_dir", type=str, default="",
+                        help="Custom directory name for novel tasks federated data. Overrides other flags if provided.")
 
     args = parser.parse_args()
     
@@ -702,8 +708,17 @@ def main():
         
         # Load local client datasets
         client_datasets = []
+        
+        novel_data_dir = "federated_data"
+        if args.novel_data_dir:
+            novel_data_dir = args.novel_data_dir
+        elif args.use_fewshot:
+            novel_data_dir = "federated_data_fewshot"
+        elif args.use_10shot:
+            novel_data_dir = "federated_data_10shot"
+            
         for c in range(num_clients):
-            c_path = os.path.join(args.data_root, "federated_data", f"client_{c}_task_{task_idx}.pt")
+            c_path = os.path.join(args.data_root, novel_data_dir, f"client_{c}_task_{task_idx}.pt")
             if os.path.exists(c_path):
                 c_data = torch.load(c_path, map_location="cpu", weights_only=False)
                 c_x, c_y = c_data["x"].float(), c_data["y"].long()
