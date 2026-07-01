@@ -53,7 +53,7 @@ class CICIoT23DataManager:
         
         # Verify paths
         if not os.path.exists(self.centralized_dir):
-            raise FileNotFoundError(f"Centralized data directory not found: {self.centralized_dir}")
+            print(f"[DataManager] Warning: Centralized data directory not found: {self.centralized_dir}. Ignore if running Federated Learning.")
         if not os.path.exists(self.global_test_file):
             raise FileNotFoundError(f"Global test file not found: {self.global_test_file} or {os.path.join(data_root, 'global_test_data.pt')}")
 
