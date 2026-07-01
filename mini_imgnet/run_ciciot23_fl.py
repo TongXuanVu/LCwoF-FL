@@ -247,97 +247,242 @@ def aggregate_fedavg(client_weights, client_sample_counts):
     return w_avg
 
 
-def aggregate_adaptive_robust(client_weights, client_sample_counts, global_weights, tau=1.0, beta_norm=0.5):
-    """
-    Adaptive Robust Aggregation inspired by AFSIC-IDS.
-    Calculates a quality score Q_i based on Log-Quantity and Update Norm (Drift from global).
-    Weights are softmaxed.
-    """
-    import math
-    import numpy as np
-    num_clients = len(client_weights)
+import logging
+
+
+# =============================================================================
+# AFSIC-IDS aggregation, copied 1:1 from AFSIC-IDS/utils/aggregation.py
+# (verbatim -- do not edit; the LCwoF wiring lives in aggregate_adaptive_robust below)
+# =============================================================================
+def is_aggregated_state_key(key, task, aggregate_backbone=False):
+    if task == 0 or aggregate_backbone:
+        return True
+    if "plasticity_adapter.frozen_source" in key:
+        return False
+    return any(sub in key for sub in ["plasticity_adapter.adapter", "gate", "fc"])
+
+
+def compute_aggregation_weights(
+    args,
+    global_model,
+    client_accs,
+    client_protos,
+    client_weights,
+    global_state_round_start,
+    active_client_indices,
+    task
+):
     Q_list = []
+    drift_list = []
     update_norm_list = []
-    
-    # Calculate Update Norm (Drift) exactly like AFSIC-IDS
-    for i in range(num_clients):
+
+    beta_acc = args.get("beta_acc", 1.0)
+    beta_proto = args.get("beta_proto", 1.0)
+    beta_novelty = args.get("beta_novelty", 0.5)
+    beta_drift = args.get("beta_drift", 0.5)
+    beta_update = args.get("beta_update", 0.2)
+
+    for c_idx, c in enumerate(active_client_indices):
+        acc_i = client_accs[c]
+
+        # Prototype Consistency
+        proto_cons_vals = []
+        for class_id in range(global_model._total_classes):
+            local_p = client_protos[c].get(class_id, {}).get("prototype")
+            global_p = global_model.global_proto_memory.get_prototype(class_id)
+            if local_p is not None and global_p is not None:
+                sim = torch.sum(F.normalize(local_p, p=2, dim=0) * F.normalize(global_p, p=2, dim=0)).item()
+                proto_cons_vals.append(sim)
+        proto_cons_i = sum(proto_cons_vals) / len(proto_cons_vals) if proto_cons_vals else 1.0
+
+        # Novelty
+        novelty_vals = []
+        new_classes = range(global_model._known_classes, global_model._total_classes)
+        old_classes = range(global_model._known_classes)
+        if new_classes and old_classes:
+            for n_c in new_classes:
+                local_p = client_protos[c].get(n_c, {}).get("prototype")
+                if local_p is not None:
+                    local_p = F.normalize(local_p, p=2, dim=0)
+                    min_dist = 1.0
+                    for o_c in old_classes:
+                        global_p = global_model.global_proto_memory.get_prototype(o_c)
+                        if global_p is not None:
+                            global_p = F.normalize(global_p, p=2, dim=0)
+                            dist = 1.0 - torch.sum(local_p * global_p).item()
+                            if dist < min_dist:
+                                min_dist = dist
+                    novelty_vals.append(min_dist)
+        novelty_i = sum(novelty_vals) / len(novelty_vals) if novelty_vals else 0.5
+
+        # Drift and Update Norm
+        drift_val = 0.0
         update_val = 0.0
         num_params = 0
-        for key in global_weights.keys():
-            if global_weights[key].dtype in [torch.float32, torch.float64, torch.float16]:
-                diff = client_weights[i][key].to('cpu').float() - global_weights[key].to('cpu').float()
+        local_dict = client_weights[c_idx]
+        for k in local_dict.keys():
+            if is_aggregated_state_key(k, task, args.get("aggregate_backbone", False)):
+                diff = local_dict[k].float() - global_state_round_start[k].float()
+                drift_val += torch.sum(diff ** 2).item()
                 update_val += torch.sum(diff ** 2).item()
                 num_params += diff.numel()
-        
-        update_norm_i = np.sqrt(update_val / max(1, num_params))
-        update_norm_list.append(update_norm_i)
-        
-        # Q_i only relies on log samples and negative update_norm (since we don't have proto_cons in LCwoF)
-        log_sample = math.log(1 + client_sample_counts[i])
-        Q_i = log_sample - beta_norm * update_norm_i
-        Q_list.append(Q_i)
 
-    # ---------------------------------------------------------
-    # EXACT COPY of AFSIC-IDS Robust Filter (MAD & Median)
-    # ---------------------------------------------------------
+        drift_i = np.sqrt(drift_val / max(1, num_params))
+        update_norm_i = np.sqrt(update_val / max(1, num_params))
+
+        Q_i = beta_acc * acc_i + beta_proto * proto_cons_i + beta_novelty * novelty_i - beta_drift * drift_i - beta_update * update_norm_i
+        Q_list.append(Q_i)
+        drift_list.append(drift_i)
+        update_norm_list.append(update_norm_i)
+
+        logging.info(
+            f"Client {c} => Q_i: {Q_i:.4f} | Acc: {acc_i*100:.2f}% | "
+            f"ProtoCons: {proto_cons_i:.4f} | Novelty: {novelty_i:.4f} | "
+            f"Drift: {drift_i:.4f} | UpdateNorm: {update_norm_i:.4f}"
+        )
+
     accepted_positions = list(range(len(Q_list)))
-    if len(Q_list) > 2:
+    if args.get("robust_filter_updates", True) and len(Q_list) > 2:
         update_arr = np.array(update_norm_list, dtype=np.float64)
+        drift_arr = np.array(drift_list, dtype=np.float64)
         update_med = float(np.median(update_arr))
+        drift_med = float(np.median(drift_arr))
         update_mad = float(np.median(np.abs(update_arr - update_med))) + 1e-8
-        z_limit = 3.5  # robust_z from AFSIC-IDS
-        
+        drift_mad = float(np.median(np.abs(drift_arr - drift_med))) + 1e-8
+        z_limit = args.get("robust_z", 3.5)
+        max_update_norm = args.get("max_update_norm", None)
         accepted_positions = []
-        for pos in range(num_clients):
+        for pos, c in enumerate(active_client_indices):
             update_ok = (update_arr[pos] - update_med) / update_mad <= z_limit
-            if update_ok:
+            drift_ok = (drift_arr[pos] - drift_med) / drift_mad <= z_limit
+            norm_ok = max_update_norm is None or update_arr[pos] <= float(max_update_norm)
+            if update_ok and drift_ok and norm_ok:
                 accepted_positions.append(pos)
             else:
-                print(f"      [Robust Filter] Client {pos} REJECTED | UpdateNorm: {update_arr[pos]:.4f}")
-                
+                logging.warning(
+                    f"Client {c} rejected by robust filter | "
+                    f"Drift: {drift_arr[pos]:.4f} | UpdateNorm: {update_arr[pos]:.4f}"
+                )
         if not accepted_positions:
-            print("      [Robust Filter] All rejected; falling back to all clients.")
+            logging.warning("Robust filter rejected all clients; falling back to all active clients.")
             accepted_positions = list(range(len(Q_list)))
 
     Q_accepted = [Q_list[pos] for pos in accepted_positions]
-    
-    # Normalize Q_i to [0, 1] to mimic AFSIC-IDS quality scores (Acc ranges 0-1)
-    # This prevents Softmax from mathematically canceling the log and reverting to FedAvg.
-    max_q = max(Q_accepted) if len(Q_accepted) > 0 else 1.0
-    min_q = min(Q_accepted) if len(Q_accepted) > 0 else 0.0
-    
-    if max_q == min_q:
-        normalized_Q = [1.0] * len(Q_accepted)
+    Q_tensor = torch.tensor(Q_accepted, dtype=torch.float32)
+    tau_agg = args.get("tau_aggregation", 1.0)
+    alpha = torch.softmax(Q_tensor / tau_agg, dim=0).tolist()
+
+    return alpha, accepted_positions, Q_accepted
+
+
+# =============================================================================
+# LCwoF wiring for the verbatim AFSIC aggregation above.
+# LCwoF has no prototype memory / adapters, so `client_protos` are empty: AFSIC's own
+# fallbacks then set proto_cons=1.0 and novelty=0.5 for EVERY client (constants that cancel
+# inside the softmax). The effective score is Q_i = beta_acc*acc_i - beta_drift*drift_i
+# - beta_update*update_norm_i, with acc_i = server-side validation accuracy of client i.
+# =============================================================================
+class _ProtoMemStub:
+    def get_prototype(self, class_id):
+        return None
+
+
+class _GlobalShim:
+    """Minimal stand-in so the verbatim AFSIC function runs on LCwoF (no prototype memory)."""
+    def __init__(self, total_classes, known_classes):
+        self._total_classes = total_classes
+        self._known_classes = known_classes
+        self.global_proto_memory = _ProtoMemStub()
+
+
+# AFSIC-IDS default aggregation hyper-parameters (utils/aggregation.py defaults).
+# aggregate_backbone=True: LCwoF trains the whole network (no frozen backbone / adapters),
+# so aggregate every parameter -- the same set FedAvg averages -- for a fair robust-vs-FedAvg test.
+_AFSIC_AGG_ARGS = {
+    "beta_acc": 1.0,
+    "beta_proto": 1.0,
+    "beta_novelty": 0.5,
+    "beta_drift": 0.5,
+    "beta_update": 0.2,
+    "tau_aggregation": 1.0,
+    "robust_z": 3.5,
+    "robust_filter_updates": True,
+    "max_update_norm": None,
+    "aggregate_backbone": True,
+}
+
+
+@torch.no_grad()
+def _client_val_acc(eval_model, client_state, val_batches, num_classes):
+    """Overall validation accuracy of a client model in [0,1] (mirrors AFSIC _compute_accuracy 'total')."""
+    eval_model.load_state_dict(client_state)
+    eval_model.eval()
+    correct = 0
+    total = 0
+    for inputs, y_true in val_batches:
+        logits = eval_model(inputs)[:, :num_classes]
+        preds = torch.argmax(logits, dim=1).cpu().numpy()
+        correct += int((preds == y_true).sum())
+        total += len(y_true)
+    return (correct / total) if total > 0 else 0.0
+
+
+def aggregate_adaptive_robust(client_weights, client_sample_counts, global_weights,
+                              eval_model=None, val_loader=None, device=None,
+                              num_eval_classes=None, task=1, max_eval_batches=4):
+    """
+    AFSIC-IDS aggregation ported 1:1 onto LCwoF-FL: verbatim `compute_aggregation_weights`
+    (Q-score + MAD robust filter + softmax) and the verbatim alpha-weighted averaging from
+    AFSIC's trainer. `client_sample_counts` is unused (AFSIC weights by quality, not volume);
+    kept for a drop-in signature with aggregate_fedavg.
+    """
+    num_clients = len(client_weights)
+    # Round-start global snapshot (state_dict returns live refs that per-client eval overwrites).
+    global_snapshot = {k: v.detach().clone() for k, v in global_weights.items()}
+
+    # Server-side validation accuracy per client (AFSIC Acc_{i,val}).
+    if (eval_model is not None) and (val_loader is not None) and (num_eval_classes is not None):
+        val_batches = []
+        for bi, batch in enumerate(val_loader):
+            if bi >= max_eval_batches:
+                break
+            val_batches.append((batch['data'].to(device), batch['label'].numpy()))
+        client_accs = [_client_val_acc(eval_model, client_weights[i], val_batches, num_eval_classes)
+                       for i in range(num_clients)]
+        eval_model.load_state_dict(global_snapshot)
     else:
-        normalized_Q = [(q - min_q) / (max_q - min_q) for q in Q_accepted]
-        
-    exp_scores = [math.exp(q / tau) for q in normalized_Q]
-    sum_exp = sum(exp_scores)
-    alphas_accepted = [e / sum_exp for e in exp_scores]
-    
-    # Reconstruct full alpha list (0 for rejected clients)
-    alphas = [0.0] * num_clients
-    for idx, pos in enumerate(accepted_positions):
-        alphas[pos] = alphas_accepted[idx]
-        
-    print(f"      [AFSIC-IDS Aggregation] Alphas: {[round(a, 4) for a in alphas]}")
-    
-    # 4. Aggregate
-    w_avg = copy.deepcopy(client_weights[0])
-    for key in w_avg.keys():
-        w_avg[key] = torch.zeros_like(w_avg[key])
-        
-    for i in range(num_clients):
-        weight = alphas[i]
-        for key in w_avg.keys():
-            if torch.is_floating_point(client_weights[i][key]):
-                w_avg[key] += client_weights[i][key] * weight
-            else:
-                if i == 0:
-                    w_avg[key] = client_weights[i][key]
-                else:
-                    w_avg[key] = torch.max(w_avg[key], client_weights[i][key])
-    return w_avg
+        client_accs = [0.0] * num_clients
+
+    active_client_indices = list(range(num_clients))
+    client_protos = [{} for _ in range(num_clients)]
+    shim = _GlobalShim(total_classes=(num_eval_classes or 0), known_classes=0)
+
+    alpha, accepted_positions, _ = compute_aggregation_weights(
+        args=_AFSIC_AGG_ARGS,
+        global_model=shim,
+        client_accs=client_accs,
+        client_protos=client_protos,
+        client_weights=client_weights,
+        global_state_round_start=global_snapshot,
+        active_client_indices=active_client_indices,
+        task=task,
+    )
+
+    client_weights_accepted = [client_weights[pos] for pos in accepted_positions]
+
+    print(f"      [AFSIC-IDS Aggregation] Acc: {[round(a, 3) for a in client_accs]} | "
+          f"Alphas: {[round(a, 4) for a in alpha]}")
+
+    # Verbatim AFSIC quality-aware weighted averaging (trainer.py).
+    global_dict = copy.deepcopy(global_snapshot)
+    aggregate_backbone = _AFSIC_AGG_ARGS.get("aggregate_backbone", False)
+    for k in global_dict.keys():
+        if is_aggregated_state_key(k, task, aggregate_backbone):
+            val = client_weights_accepted[0][k].float() * alpha[0]
+            for c_idx in range(1, len(client_weights_accepted)):
+                val += client_weights_accepted[c_idx][k].float() * alpha[c_idx]
+            global_dict[k] = val.to(global_dict[k].dtype)
+    return global_dict
 
 
 def client_select_exemplars(exemplar_memory, x, y, classes, m_per_class=20):
@@ -668,9 +813,13 @@ def main():
             train_dataset = CICIoT23Dataset(c_x, c_y)
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
             client_loaders.append(train_loader)
-            
+
+        # Small held-out val set reused every round for server-side quality scoring
+        val_dataset_agg = dm.get_test_dataset(seen_classes, max_samples_per_class=200)
+        val_loader_agg = DataLoader(val_dataset_agg, batch_size=args.batch_size, shuffle=False)
+
         initial_epoch = start_epoch if (start_task == 1) else 0
-        
+
         for epoch in range(initial_epoch, args.epochs_base):
             # Define client local training worker for ThreadPoolExecutor
             def train_local_client_task1(c):
@@ -719,9 +868,12 @@ def main():
             if args.aggregation == "fedavg":
                 aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
             else:
-                aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
+                aggregated_weights = aggregate_adaptive_robust(
+                    client_weights, client_sample_counts, global_model.state_dict(),
+                    eval_model=global_model, val_loader=val_loader_agg, device=device,
+                    num_eval_classes=len(seen_classes))
             global_model.load_state_dict(aggregated_weights)
-            
+
             print(f"Task 1 Round {epoch+1}/{args.epochs_base} => Avg Client Loss: {avg_loss:.4f}")
             
             # Server Evaluation
@@ -804,6 +956,10 @@ def main():
         print("\n" + "="*80)
         print(f"STARTING TASK {task_idx} - FEDERATED (Novel classes {classes}, Clients: {num_clients})")
         print("="*80)
+
+        # Small held-out val set (all seen classes) reused for server-side quality scoring
+        val_dataset_agg = dm.get_test_dataset(seen_classes, max_samples_per_class=200)
+        val_loader_agg = DataLoader(val_dataset_agg, batch_size=args.batch_size, shuffle=False)
         
         # Load local client datasets
         client_datasets = []
@@ -959,9 +1115,12 @@ def main():
                 if args.aggregation == "fedavg":
                     aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
                 else:
-                    aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
+                    aggregated_weights = aggregate_adaptive_robust(
+                        client_weights, client_sample_counts, global_model.state_dict(),
+                        eval_model=global_model, val_loader=val_loader_agg, device=device,
+                        num_eval_classes=len(seen_classes))
                 global_model.load_state_dict(aggregated_weights)
-                
+
                 print(f"Task {task_idx} [Phase 2] Round {epoch+1}/{args.epochs_novel} => Avg Client Loss: {avg_loss:.4f}")
                 
                 # Server Evaluation
@@ -1093,7 +1252,10 @@ def main():
                     if args.aggregation == "fedavg":
                         aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
                     else:
-                        aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
+                        aggregated_weights = aggregate_adaptive_robust(
+                            client_weights, client_sample_counts, global_model.state_dict(),
+                            eval_model=global_model, val_loader=val_loader_agg, device=device,
+                            num_eval_classes=len(seen_classes))
                     global_model.load_state_dict(aggregated_weights)
                 else:
                     avg_loss = 0.0
