@@ -278,7 +278,18 @@ def aggregate_adaptive_robust(client_weights, client_sample_counts, global_weigh
             accepted_positions = list(range(len(Q_list)))
 
     Q_accepted = [Q_list[pos] for pos in accepted_positions]
-    exp_scores = [math.exp(q / tau) for q in Q_accepted]
+    
+    # Normalize Q_i to [0, 1] to mimic AFSIC-IDS quality scores (Acc ranges 0-1)
+    # This prevents Softmax from mathematically canceling the log and reverting to FedAvg.
+    max_q = max(Q_accepted) if len(Q_accepted) > 0 else 1.0
+    min_q = min(Q_accepted) if len(Q_accepted) > 0 else 0.0
+    
+    if max_q == min_q:
+        normalized_Q = [1.0] * len(Q_accepted)
+    else:
+        normalized_Q = [(q - min_q) / (max_q - min_q) for q in Q_accepted]
+        
+    exp_scores = [math.exp(q / tau) for q in normalized_Q]
     sum_exp = sum(exp_scores)
     alphas_accepted = [e / sum_exp for e in exp_scores]
     
