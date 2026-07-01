@@ -225,6 +225,28 @@ def load_checkpoint(model, checkpoint_path, device):
     return checkpoint
 
 
+def aggregate_fedavg(client_weights, client_sample_counts):
+    total_samples = sum(client_sample_counts)
+    if total_samples == 0:
+        return client_weights[0]
+    
+    w_avg = copy.deepcopy(client_weights[0])
+    for key in w_avg.keys():
+        w_avg[key] = torch.zeros_like(w_avg[key])
+        
+    for i in range(len(client_weights)):
+        weight = client_sample_counts[i] / total_samples
+        for key in w_avg.keys():
+            if torch.is_floating_point(client_weights[i][key]):
+                w_avg[key] += client_weights[i][key] * weight
+            else:
+                if i == 0:
+                    w_avg[key] = client_weights[i][key]
+                else:
+                    w_avg[key] = torch.max(w_avg[key], client_weights[i][key])
+    return w_avg
+
+
 def aggregate_adaptive_robust(client_weights, client_sample_counts, global_weights, tau=1.0, beta_norm=0.5):
     """
     Adaptive Robust Aggregation inspired by AFSIC-IDS.
@@ -405,6 +427,8 @@ def main():
                         help="Use the 10-shot data split for incremental tasks")
     parser.add_argument("--novel_data_dir", type=str, default="",
                         help="Custom directory name for novel tasks federated data. Overrides other flags if provided.")
+    parser.add_argument("--aggregation", type=str, default="robust", choices=["fedavg", "robust"],
+                        help="Aggregation method to use at the server (default: robust)")
 
     args = parser.parse_args()
     
@@ -692,7 +716,10 @@ def main():
                 
             # Server FedAvg aggregation
             avg_loss = np.mean(client_losses)
-            aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
+            if args.aggregation == "fedavg":
+                aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
+            else:
+                aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
             global_model.load_state_dict(aggregated_weights)
             
             print(f"Task 1 Round {epoch+1}/{args.epochs_base} => Avg Client Loss: {avg_loss:.4f}")
@@ -929,7 +956,10 @@ def main():
                 
                 # Server aggregation
                 avg_loss = np.mean(client_losses)
-                aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
+                if args.aggregation == "fedavg":
+                    aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
+                else:
+                    aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
                 global_model.load_state_dict(aggregated_weights)
                 
                 print(f"Task {task_idx} [Phase 2] Round {epoch+1}/{args.epochs_novel} => Avg Client Loss: {avg_loss:.4f}")
@@ -1060,7 +1090,10 @@ def main():
                 if len(client_weights) > 0:
                     # Server aggregation
                     avg_loss = np.mean(client_losses)
-                    aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
+                    if args.aggregation == "fedavg":
+                        aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
+                    else:
+                        aggregated_weights = aggregate_adaptive_robust(client_weights, client_sample_counts, global_model.state_dict())
                     global_model.load_state_dict(aggregated_weights)
                 else:
                     avg_loss = 0.0
