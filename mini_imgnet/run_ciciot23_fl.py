@@ -232,37 +232,62 @@ def aggregate_adaptive_robust(client_weights, client_sample_counts, global_weigh
     Weights are softmaxed.
     """
     import math
+    import numpy as np
     num_clients = len(client_weights)
-    scores = []
+    Q_list = []
+    update_norm_list = []
     
-    # 1. Calculate Update Norm (Drift) for each client
-    norms = []
+    # Calculate Update Norm (Drift) exactly like AFSIC-IDS
     for i in range(num_clients):
-        drift_sq = 0.0
+        update_val = 0.0
+        num_params = 0
         for key in global_weights.keys():
             if global_weights[key].dtype in [torch.float32, torch.float64, torch.float16]:
                 diff = client_weights[i][key].to('cpu').float() - global_weights[key].to('cpu').float()
-                drift_sq += torch.sum(diff ** 2).item()
-        norms.append(math.sqrt(drift_sq))
-    
-    max_norm = max(norms) if max(norms) > 0 else 1.0
-    normalized_norms = [n / max_norm for n in norms]
-    
-    # 2. Calculate Q_i score using log(1 + samples) to soften quantity skew
-    log_samples = [math.log(1 + count) for count in client_sample_counts]
-    max_log = max(log_samples) if max(log_samples) > 0 else 1.0
-    normalized_logs = [l / max_log for l in log_samples]
-    
-    for i in range(num_clients):
-        Q_i = normalized_logs[i] - beta_norm * normalized_norms[i]
-        scores.append(Q_i)
+                update_val += torch.sum(diff ** 2).item()
+                num_params += diff.numel()
         
-    # 3. Softmax weighting
-    exp_scores = [math.exp(q / tau) for q in scores]
+        update_norm_i = np.sqrt(update_val / max(1, num_params))
+        update_norm_list.append(update_norm_i)
+        
+        # Q_i only relies on log samples and negative update_norm (since we don't have proto_cons in LCwoF)
+        log_sample = math.log(1 + client_sample_counts[i])
+        Q_i = log_sample - beta_norm * update_norm_i
+        Q_list.append(Q_i)
+
+    # ---------------------------------------------------------
+    # EXACT COPY of AFSIC-IDS Robust Filter (MAD & Median)
+    # ---------------------------------------------------------
+    accepted_positions = list(range(len(Q_list)))
+    if len(Q_list) > 2:
+        update_arr = np.array(update_norm_list, dtype=np.float64)
+        update_med = float(np.median(update_arr))
+        update_mad = float(np.median(np.abs(update_arr - update_med))) + 1e-8
+        z_limit = 3.5  # robust_z from AFSIC-IDS
+        
+        accepted_positions = []
+        for pos in range(num_clients):
+            update_ok = (update_arr[pos] - update_med) / update_mad <= z_limit
+            if update_ok:
+                accepted_positions.append(pos)
+            else:
+                print(f"      [Robust Filter] Client {pos} REJECTED | UpdateNorm: {update_arr[pos]:.4f}")
+                
+        if not accepted_positions:
+            print("      [Robust Filter] All rejected; falling back to all clients.")
+            accepted_positions = list(range(len(Q_list)))
+
+    Q_accepted = [Q_list[pos] for pos in accepted_positions]
+    exp_scores = [math.exp(q / tau) for q in Q_accepted]
     sum_exp = sum(exp_scores)
-    alphas = [e / sum_exp for e in exp_scores]
+    alphas_accepted = [e / sum_exp for e in exp_scores]
     
-    print(f"      [Adaptive Aggregation] Alphas: {[round(a, 4) for a in alphas]}")
+    # Reconstruct full alpha list (0 for rejected clients)
+    alphas = [0.0] * num_clients
+    for idx, pos in enumerate(accepted_positions):
+        alphas[pos] = alphas_accepted[idx]
+        
+    print(f"      [AFSIC-IDS Aggregation] Alphas: {[round(a, 4) for a in alphas]}")
     
     # 4. Aggregate
     w_avg = copy.deepcopy(client_weights[0])
