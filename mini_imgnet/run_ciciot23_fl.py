@@ -810,6 +810,12 @@ def main():
                 c_path = _cand
                 if os.path.exists(c_path):
                     break
+            if not os.path.exists(c_path):
+                # Voi partition 100-client, mot so client KHONG co du lieu o task nay
+                # (vd task 1 chi 47/50 client co file). Bo qua an toan.
+                client_datasets.append((None, None))
+                print(f"  Client {c}: khong co file task 1 -> bo qua.")
+                continue
             c_data = torch.load(c_path, map_location="cpu", weights_only=False)
             c_x, c_y = c_data["x"].float(), _remap_labels(c_data["y"].long())
             if args.debug:
@@ -817,14 +823,20 @@ def main():
                 c_y = c_y[:500]
             client_datasets.append((c_x, c_y))
             print(f"  Client {c} loaded: {len(c_x)} training samples.")
-            
+
+        # Chi train tren cac client THUC SU co du lieu
+        active_clients = [c for c in range(num_clients)
+                          if client_datasets[c][0] is not None and len(client_datasets[c][0]) > 0]
+        if not active_clients:
+            raise RuntimeError("Task 1: khong co client nao co du lieu. Kiem tra lai --data_root.")
+        print(f"  -> Task 1: {len(active_clients)}/{num_clients} client co du lieu.")
+
         # Pre-create DataLoaders for all clients to avoid creation overhead in round loop
-        client_loaders = []
-        for c in range(num_clients):
+        client_loaders = {}
+        for c in active_clients:
             c_x, c_y = client_datasets[c]
             train_dataset = CICIoT23Dataset(c_x, c_y)
-            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-            client_loaders.append(train_loader)
+            client_loaders[c] = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
         # Small held-out val set reused every round for server-side quality scoring
         val_dataset_agg = dm.get_test_dataset(seen_classes, max_samples_per_class=200)
@@ -867,9 +879,9 @@ def main():
                 avg_l = losses / (len(train_loader) * args.local_epochs)
                 return local_model.state_dict(), len(c_x), avg_l
 
-            # Execute client training concurrently
-            with ThreadPoolExecutor(max_workers=num_clients) as executor:
-                results = list(executor.map(train_local_client_task1, range(num_clients)))
+            # Execute client training concurrently (chi cac client co du lieu)
+            with ThreadPoolExecutor(max_workers=min(len(active_clients), 16)) as executor:
+                results = list(executor.map(train_local_client_task1, active_clients))
                 
             client_weights = [r[0] for r in results]
             client_sample_counts = [r[1] for r in results]
@@ -921,8 +933,8 @@ def main():
                 'client_memories': client_memories,
             }, epoch_checkpoint_path)
             
-        # Clients select exemplars locally
-        for c in range(num_clients):
+        # Clients select exemplars locally (bo qua client khong co du lieu)
+        for c in active_clients:
             c_x, c_y = client_datasets[c]
             client_select_exemplars(client_memories[c], c_x, c_y, classes, m_per_class=args.memory_per_class)
             
