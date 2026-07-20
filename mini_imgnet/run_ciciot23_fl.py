@@ -20,6 +20,7 @@ sys.path.append(str(dir_path))
 
 from mini_imgnet.cnn1d import CNN1DConvNet
 from mini_imgnet.dataloader_ciciot23 import CICIoT23DataManager, CICIoT23Dataset
+from mini_imgnet.label_remap import init_remap as _init_label_remap, remap as _remap_labels
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 import matplotlib
 matplotlib.use("Agg")
@@ -545,6 +546,9 @@ def main():
     parser = argparse.ArgumentParser(description="LCwoF training in Federated Learning scenario")
     parser.add_argument("--data_root", type=str, default="C:/FederatedLearning/FL/core/data_split",
                         help="Path to the directory containing global_test_data.pt and federated_data")
+    parser.add_argument("--total_clients", type=int, default=100,
+                        help="Tong so client trong partition (100 cho bo data '100 client', 10 cho bo cu). "
+                             "So client active moi task = 50%%..100%% cua gia tri nay.")
     parser.add_argument("--l2_lambda", type=float, default=500.0,
                         help="Lambda coefficient for L2 parameter regularization (default 500.0)")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate (default 0.001)")
@@ -787,7 +791,8 @@ def main():
         if not seen_classes:
             seen_classes.extend(classes)
             
-        num_clients = 5 # 5 clients for Task 1
+        # Lich client tang dan theo TY LE 50% -> 100% (10 client: 5..10 | 100 client: 50..100)
+        num_clients = int(round(args.total_clients * 0.5))
         print("\n" + "="*80)
         print(f"STARTING TASK 1 - FEDERATED (Base classes {classes}, Clients: {num_clients})")
         print("="*80)
@@ -795,11 +800,18 @@ def main():
         # Load local client datasets
         client_datasets = []
         for c in range(num_clients):
-            c_path = os.path.join(args.data_root, "federated_data", f"client_{c}_task_1.pt")
-            if not os.path.exists(c_path):
-                c_path = os.path.join(args.data_root, "data", "federated_data", f"client_{c}_task_1.pt")
+            # Ho tro ca 3 layout: <root>/federated_data/, <root>/data/federated_data/,
+            # va layout PHANG <root>/*.pt (Kaggle dataset khong giu thu muc con)
+            for _cand in (
+                os.path.join(args.data_root, "federated_data", f"client_{c}_task_1.pt"),
+                os.path.join(args.data_root, "data", "federated_data", f"client_{c}_task_1.pt"),
+                os.path.join(args.data_root, f"client_{c}_task_1.pt"),
+            ):
+                c_path = _cand
+                if os.path.exists(c_path):
+                    break
             c_data = torch.load(c_path, map_location="cpu", weights_only=False)
-            c_x, c_y = c_data["x"].float(), c_data["y"].long()
+            c_x, c_y = c_data["x"].float(), _remap_labels(c_data["y"].long())
             if args.debug:
                 c_x = c_x[:500]
                 c_y = c_y[:500]
@@ -898,7 +910,7 @@ def main():
             plot_confusion_matrix_round(y_true, y_pred, round_idx, 1, 1, epoch + 1, cm_dir)
             
             # Save epoch checkpoint
-            epoch_checkpoint_path = os.path.join(run_dir, "checkpoints", f"task_1_round_{epoch+1}.pt")
+            epoch_checkpoint_path = os.path.join(run_dir, "checkpoints", "resume_latest.pt")
             os.makedirs(os.path.dirname(epoch_checkpoint_path), exist_ok=True)
             torch.save({
                 'task_idx': 1,
@@ -952,7 +964,8 @@ def main():
             if c not in seen_classes:
                 seen_classes.append(c)
                 
-        num_clients = 4 + task_idx  # Task 2: 6, Task 3: 7, ..., Task 6: 10 clients
+        # Task 2..6 -> 60%, 70%, 80%, 90%, 100% tong so client
+        num_clients = int(round(args.total_clients * (0.4 + 0.1 * task_idx)))
         print("\n" + "="*80)
         print(f"STARTING TASK {task_idx} - FEDERATED (Novel classes {classes}, Clients: {num_clients})")
         print("="*80)
@@ -974,9 +987,12 @@ def main():
             
         for c in range(num_clients):
             c_path = os.path.join(args.data_root, novel_data_dir, f"client_{c}_task_{task_idx}.pt")
+            if not os.path.exists(c_path):
+                # layout PHANG (Kaggle dataset)
+                c_path = os.path.join(args.data_root, f"client_{c}_task_{task_idx}.pt")
             if os.path.exists(c_path):
                 c_data = torch.load(c_path, map_location="cpu", weights_only=False)
-                c_x, c_y = c_data["x"].float(), c_data["y"].long()
+                c_x, c_y = c_data["x"].float(), _remap_labels(c_data["y"].long())
                 if args.debug:
                     c_x = c_x[:500]
                     c_y = c_y[:500]
@@ -1144,7 +1160,7 @@ def main():
                 os.makedirs(cm_dir, exist_ok=True)
                 plot_confusion_matrix_round(y_true, y_pred, round_idx, task_idx, 2, epoch + 1, cm_dir)
                 
-                epoch_checkpoint_path = os.path.join(run_dir, "checkpoints", f"task_{task_idx}_phase2_round_{epoch+1}.pt")
+                epoch_checkpoint_path = os.path.join(run_dir, "checkpoints", "resume_latest.pt")
                 os.makedirs(os.path.dirname(epoch_checkpoint_path), exist_ok=True)
                 torch.save({
                     'task_idx': task_idx,
@@ -1283,7 +1299,7 @@ def main():
                 os.makedirs(cm_dir, exist_ok=True)
                 plot_confusion_matrix_round(y_true, y_pred, round_idx, task_idx, 3, epoch + 1, cm_dir)
                 
-                epoch_checkpoint_path = os.path.join(run_dir, "checkpoints", f"task_{task_idx}_phase3_round_{epoch+1}.pt")
+                epoch_checkpoint_path = os.path.join(run_dir, "checkpoints", "resume_latest.pt")
                 os.makedirs(os.path.dirname(epoch_checkpoint_path), exist_ok=True)
                 torch.save({
                     'task_idx': task_idx,

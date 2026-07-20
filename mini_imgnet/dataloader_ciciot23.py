@@ -61,7 +61,12 @@ class CICIoT23DataManager:
         print("[DataManager] Loading global test data...")
         test_dict = torch.load(self.global_test_file, map_location="cpu", weights_only=False)
         self.test_x = test_dict["x"].float()
-        self.test_y = test_dict["y"].long()
+        try:
+            from .label_remap import init_remap, remap
+        except ImportError:
+            from label_remap import init_remap, remap
+        init_remap(data_root)
+        self.test_y = remap(test_dict["y"].long())
         print(f"[DataManager] Loaded test set: {self.test_x.shape[0]} samples")
 
         # Memory for exemplars: class_idx -> {'x': tensor, 'y': tensor}
