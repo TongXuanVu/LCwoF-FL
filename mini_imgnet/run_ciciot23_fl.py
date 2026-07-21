@@ -621,8 +621,8 @@ def main():
     parser.add_argument("--memory_per_class", type=int, default=20, help="Exemplar memory budget per class (default 20)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default 42)")
     parser.add_argument("--debug", action="store_true", help="Debug mode: fast training with 2 rounds")
-    parser.add_argument("--max_test_samples_per_class", type=int, default=5000,
-                        help="Maximum test samples per class to evaluate on (default 5000)")
+    parser.add_argument("--max_test_samples_per_class", type=int, default=0,
+                        help="So mau test toi da moi lop. 0 (mac dinh) = KHONG gioi han, danh gia tren toan bo tap test cua cac lop da hoc.")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "test", "resume"],
                         help="Execution mode: train (default), test (evaluate checkpoints), or resume (resume training)")
     parser.add_argument("--resume_path", type=str, default="",
@@ -652,6 +652,10 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Device] Using device: {device}")
+
+    # <=0 nghia la KHONG gioi han: danh gia tren TOAN BO mau test cua cac lop da hoc
+    _test_cap = None if args.max_test_samples_per_class <= 0 else args.max_test_samples_per_class
+    print(f"[Eval] Test set: {'TOAN BO mau cua cac lop da hoc' if _test_cap is None else str(_test_cap) + ' mau/lop'}")
 
     # Che do xu ly BatchNorm khi aggregate (chan doan FedAvg tren du lieu non-IID)
     if args.bn_mode == "gn":
@@ -750,7 +754,7 @@ def main():
                         seen_classes.extend(tc)
                     seen_classes = seen_classes[:num_classes]
                     
-                test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=args.max_test_samples_per_class)
+                test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=_test_cap)
                 test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
                 metrics, _, _ = evaluate(global_model, test_loader, device)
                 
@@ -978,7 +982,7 @@ def main():
             print(f"Task 1 Round {epoch+1}/{args.epochs_base} => Avg Client Loss: {avg_loss:.4f}")
             
             # Server Evaluation
-            test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=args.max_test_samples_per_class)
+            test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=_test_cap)
             test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
             metrics_round, y_pred, y_true = evaluate(global_model, test_loader, device)
             
@@ -1017,7 +1021,7 @@ def main():
             
         global_model.save_base_checkpoint()
         
-        test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=args.max_test_samples_per_class)
+        test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=_test_cap)
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
         metrics, y_pred, y_true = evaluate(global_model, test_loader, device)
         
@@ -1232,7 +1236,7 @@ def main():
                 print(f"Task {task_idx} [Phase 2] Round {epoch+1}/{args.epochs_novel} => Avg Client Loss: {avg_loss:.4f}")
                 
                 # Server Evaluation
-                test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=args.max_test_samples_per_class)
+                test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=_test_cap)
                 test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
                 metrics_round, y_pred, y_true = evaluate(global_model, test_loader, device)
                 
@@ -1374,7 +1378,7 @@ def main():
                 print(f"Task {task_idx} [Phase 3 - CRT] Round {epoch+1}/{args.epochs_crt} => Avg Client Loss: {avg_loss:.4f}")
                 
                 # Server Evaluation
-                test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=args.max_test_samples_per_class)
+                test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=_test_cap)
                 test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
                 metrics_round, y_pred, y_true = evaluate(global_model, test_loader, device)
                 
@@ -1417,7 +1421,7 @@ def main():
                 client_select_exemplars(client_memories[c], c_x, c_y, classes, m_per_class=args.memory_per_class)
                 
         # Server Evaluation
-        test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=args.max_test_samples_per_class)
+        test_dataset = dm.get_test_dataset(seen_classes, max_samples_per_class=_test_cap)
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
         metrics, y_pred, y_true = evaluate(global_model, test_loader, device)
         
