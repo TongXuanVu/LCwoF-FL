@@ -28,13 +28,36 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
+def convert_bn_to_gn(module, groups=8):
+    """
+    Thay moi BatchNorm1d bang GroupNorm. GroupNorm KHONG co running stats nen
+    mien nhiem voi van de "trung binh hoa thong ke BN giua cac client non-IID".
+    Chi dung khi --bn_mode gn (mac dinh giu nguyen kien truc goc).
+    """
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm1d):
+            c = child.num_features
+            g = groups
+            while g > 1 and c % g != 0:
+                g -= 1
+            setattr(module, name, nn.GroupNorm(g, c))
+        else:
+            convert_bn_to_gn(child, groups)
+    return module
+
+
 class CICIoT23Model(nn.Module):
     """
     CNN1D + Dynamic Fully Connected Layer model for Class-Incremental Learning on CIC-IoT23.
     """
+    # Dat = True (tu --bn_mode gn) truoc khi tao model de doi BatchNorm -> GroupNorm
+    USE_GROUPNORM = False
+
     def __init__(self):
         super(CICIoT23Model, self).__init__()
         self.encoder = CNN1DConvNet()
+        if CICIoT23Model.USE_GROUPNORM:
+            convert_bn_to_gn(self.encoder)
         # Start with base task (Task 1 has 6 classes)
         self.fc = nn.Linear(self.encoder.out_dim, 6, bias=False)
         self.checkpoint_init = None
@@ -226,18 +249,52 @@ def load_checkpoint(model, checkpoint_path, device):
     return checkpoint
 
 
-def aggregate_fedavg(client_weights, client_sample_counts):
+def _is_bn_stat_key(key):
+    """running_mean / running_var / num_batches_tracked cua BatchNorm."""
+    return ("running_mean" in key) or ("running_var" in key) or ("num_batches_tracked" in key)
+
+
+@torch.no_grad()
+def recalibrate_bn(model, loader, device, max_batches=20):
+    """
+    Tinh lai running stats cua BatchNorm tren server bang vai batch du lieu val.
+
+    Ly do: FedAvg trung binh hoa running_mean/var cua cac client cuc ky non-IID
+    (client 40 co 49 mau, client 22 co 622k mau) -> thong ke BN toan cuc vo nghia,
+    la loi kinh dien lam FedAvg sap tren du lieu lech phan bo.
+    """
+    bns = [m for m in model.modules() if isinstance(m, nn.BatchNorm1d)]
+    if not bns or loader is None:
+        return
+    for m in bns:
+        m.reset_running_stats()
+        m.momentum = None  # lay trung binh tich luy thay vi EMA
+    was_training = model.training
+    model.train()
+    for i, batch in enumerate(loader):
+        if i >= max_batches:
+            break
+        model(batch['data'].to(device))
+    if not was_training:
+        model.eval()
+
+
+def aggregate_fedavg(client_weights, client_sample_counts, skip_bn_stats=False):
     total_samples = sum(client_sample_counts)
     if total_samples == 0:
         return client_weights[0]
-    
+
     w_avg = copy.deepcopy(client_weights[0])
     for key in w_avg.keys():
+        if skip_bn_stats and _is_bn_stat_key(key):
+            continue  # giu nguyen gia tri cua client dau, se duoc recalibrate sau
         w_avg[key] = torch.zeros_like(w_avg[key])
-        
+
     for i in range(len(client_weights)):
         weight = client_sample_counts[i] / total_samples
         for key in w_avg.keys():
+            if skip_bn_stats and _is_bn_stat_key(key):
+                continue
             if torch.is_floating_point(client_weights[i][key]):
                 w_avg[key] += client_weights[i][key] * weight
             else:
@@ -549,6 +606,10 @@ def main():
     parser.add_argument("--total_clients", type=int, default=100,
                         help="Tong so client trong partition (100 cho bo data '100 client', 10 cho bo cu). "
                              "So client active moi task = 50%%..100%% cua gia tri nay.")
+    parser.add_argument("--bn_mode", type=str, default="avg", choices=["avg", "recalib", "gn"],
+                        help="Xu ly BatchNorm khi aggregate: avg = trung binh ca running stats (goc); "
+                             "recalib = khong trung binh stats, tinh lai tren server; "
+                             "gn = thay BatchNorm1d bang GroupNorm (bat bien voi non-IID).")
     parser.add_argument("--l2_lambda", type=float, default=500.0,
                         help="Lambda coefficient for L2 parameter regularization (default 500.0)")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate (default 0.001)")
@@ -591,6 +652,15 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Device] Using device: {device}")
+
+    # Che do xu ly BatchNorm khi aggregate (chan doan FedAvg tren du lieu non-IID)
+    if args.bn_mode == "gn":
+        CICIoT23Model.USE_GROUPNORM = True
+        print("[BN] bn_mode=gn -> thay BatchNorm1d bang GroupNorm (khong co running stats).")
+    elif args.bn_mode == "recalib":
+        print("[BN] bn_mode=recalib -> KHONG trung binh running stats; tinh lai tren server moi round.")
+    else:
+        print("[BN] bn_mode=avg -> trung binh ca running stats (hanh vi goc).")
     
     # 1. Setup Global Test Data Manager
     dm = CICIoT23DataManager(data_root=args.data_root)
@@ -894,13 +964,16 @@ def main():
             # Server FedAvg aggregation
             avg_loss = np.mean(client_losses)
             if args.aggregation == "fedavg":
-                aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
+                aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts,
+                                                      skip_bn_stats=(args.bn_mode == 'recalib'))
             else:
                 aggregated_weights = aggregate_adaptive_robust(
                     client_weights, client_sample_counts, global_model.state_dict(),
                     eval_model=global_model, val_loader=val_loader_agg, device=device,
                     num_eval_classes=len(seen_classes))
             global_model.load_state_dict(aggregated_weights)
+            if args.bn_mode == 'recalib':
+                recalibrate_bn(global_model, val_loader_agg, device)
 
             print(f"Task 1 Round {epoch+1}/{args.epochs_base} => Avg Client Loss: {avg_loss:.4f}")
             
@@ -1145,13 +1218,16 @@ def main():
                 # Server aggregation
                 avg_loss = np.mean(client_losses)
                 if args.aggregation == "fedavg":
-                    aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
+                    aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts,
+                                                      skip_bn_stats=(args.bn_mode == 'recalib'))
                 else:
                     aggregated_weights = aggregate_adaptive_robust(
                         client_weights, client_sample_counts, global_model.state_dict(),
                         eval_model=global_model, val_loader=val_loader_agg, device=device,
                         num_eval_classes=len(seen_classes))
                 global_model.load_state_dict(aggregated_weights)
+                if args.bn_mode == 'recalib':
+                    recalibrate_bn(global_model, val_loader_agg, device)
 
                 print(f"Task {task_idx} [Phase 2] Round {epoch+1}/{args.epochs_novel} => Avg Client Loss: {avg_loss:.4f}")
                 
@@ -1282,13 +1358,16 @@ def main():
                     # Server aggregation
                     avg_loss = np.mean(client_losses)
                     if args.aggregation == "fedavg":
-                        aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts)
+                        aggregated_weights = aggregate_fedavg(client_weights, client_sample_counts,
+                                                      skip_bn_stats=(args.bn_mode == 'recalib'))
                     else:
                         aggregated_weights = aggregate_adaptive_robust(
                             client_weights, client_sample_counts, global_model.state_dict(),
                             eval_model=global_model, val_loader=val_loader_agg, device=device,
                             num_eval_classes=len(seen_classes))
                     global_model.load_state_dict(aggregated_weights)
+                    if args.bn_mode == 'recalib':
+                        recalibrate_bn(global_model, val_loader_agg, device)
                 else:
                     avg_loss = 0.0
                     
