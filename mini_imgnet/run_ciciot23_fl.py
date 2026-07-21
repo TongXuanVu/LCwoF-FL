@@ -609,7 +609,8 @@ def main():
     global_model = CICIoT23Model().to(device)
     
     # Client memories list: 10 clients (0 to 9)
-    client_memories = [{} for _ in range(10)]
+    # Mot ban ghi nho exemplar cho MOI client trong partition (100 client, khong phai 10)
+    client_memories = [{} for _ in range(args.total_clients)]
     
     # -------------------------------------------------------------------------
     # MODE: TEST
@@ -727,6 +728,9 @@ def main():
             
         if 'client_memories' in checkpoint:
             client_memories = checkpoint['client_memories']
+            # Checkpoint cu co the it client hon partition hien tai -> bu them cho du
+            while len(client_memories) < args.total_clients:
+                client_memories.append({})
             print(f"[DataManager] Restored exemplar memory containing {len(client_memories)} clients.")
             
         filename = os.path.basename(args.resume_path)
