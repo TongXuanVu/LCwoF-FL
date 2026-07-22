@@ -814,11 +814,19 @@ def main():
             start_epoch = 0
             start_phase = 2 if start_task > 1 else 1
             print(f"[Resume] Final Task {task_idx_completed} checkpoint detected. Resuming from Task {start_task} (Pha {start_phase}, Round 1).")
-        elif "round" in filename or "epoch" in filename:
+        elif "round" in filename or "epoch" in filename or "latest" in filename:
+            # 'latest' = file resume rolling (resume_latest.pt) ghi de moi round.
+            # Doc task/phase/epoch tu payload trong checkpoint.
             start_task = checkpoint.get('task_idx', 1)
             start_epoch = checkpoint.get('epoch', 0)
             start_phase = checkpoint.get('phase', 1)
             print(f"[Resume] Round checkpoint detected. Resuming Task {start_task} (Pha {start_phase}) starting at Round {start_epoch + 1}.")
+        else:
+            # Fallback an toan: neu ten file khong ro, van doc tu payload thay vi crash.
+            start_task = checkpoint.get('task_idx', 1)
+            start_epoch = checkpoint.get('epoch', 0)
+            start_phase = checkpoint.get('phase', 1)
+            print(f"[Resume] Unknown checkpoint name, doc tu payload: Task {start_task} Pha {start_phase} Round {start_epoch + 1}.")
             
         run_dir = os.path.dirname(os.path.abspath(args.resume_path))
         if os.path.basename(run_dir) == "checkpoints":
