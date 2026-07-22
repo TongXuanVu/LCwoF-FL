@@ -234,9 +234,13 @@ def load_checkpoint(model, checkpoint_path, device):
     fc_weight = state_dict['fc.weight']
     num_classes = fc_weight.shape[0]
     
-    # Expand/resize model.fc to match num_classes
-    model.fc = nn.Linear(model.encoder.out_dim, num_classes, bias=False)
+    # Expand/resize model.fc to match num_classes.
+    # .to(device): nn.Linear moi mac dinh o CPU -> phai chuyen len dung device cua model,
+    # neu khong se loi "mat2 is on cpu, different from ... cuda" khi eval sau resume.
+    _dev = next(model.parameters()).device
+    model.fc = nn.Linear(model.encoder.out_dim, num_classes, bias=False).to(_dev)
     model.load_state_dict(state_dict)
+    model.to(_dev)
     
     # Restore checkpoint_init (L2 regularization anchor) and rebuild cached parameter pairs
     if 'checkpoint_init' in checkpoint and checkpoint['checkpoint_init'] is not None:
